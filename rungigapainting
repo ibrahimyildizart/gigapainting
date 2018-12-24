@@ -1,0 +1,204 @@
+# Google Art Project fullsize image downloader.
+# By Henrik Nyh <http://henrik.nyh.se> 2011-02-05 under the MIT license.
+# Requires Ruby and ImageMagick. 
+#
+# Usage e.g.:
+#   ruby google_art_project.rb http://www.googleartproject.com/museums/tate/portrait-of-william-style-of-langley-174
+#
+# You can specify multiple URLs on the command line, separated by space.
+# Or you can specify no URLs on the command line and instead list them at the end of this file, one on each line,
+# with "__END__" before the list.
+#
+# On OS X, it sets "Downloaded from" metadata and reveals in Finder.
+#
+# Can reportedly run on Windows as well, with Ruby from http://www.ruby-lang.org/en/downloads/
+# and ImageMagick from http://www.imagemagick.org/script/binary-releases.php#windows
+# Note that you may need to edit the TEMP_DIRECTORY/OUTPUT_DIRECTORY below.
+
+require "open-uri"
+require "fileutils"
+
+module Kernel
+  def windows?
+    RUBY_PLATFORM.include?("mswin")
+  end
+end
+
+class GAPDownloader
+
+  if windows?
+    # Case-sensitive. Use forward slashes, or double-escape backslashes.
+    TEMP_DIRECTORY = "C:/WINDOWS/Temp"
+    OUTPUT_DIRECTORY = TEMP_DIRECTORY
+  else
+    TEMP_DIRECTORY = "/tmp"
+    OUTPUT_DIRECTORY = "#{ENV['HOME']}/Downloads"
+    FileUtils.mkdir_p OUTPUT_DIRECTORY
+  end
+
+  # You can lower this if you get ridiculously high-res images otherwise.
+  MAX_ZOOM_ALLOWED = 10
+
+  class RuntimeError < StandardError; end
+
+  def initialize(url)
+    ensure_image_magick!
+    @url = url
+    verify_url!
+  end
+
+  def download
+    get_image_id
+    determine_zoom
+    get_tiles
+    stitch_tiles
+    trim
+    set_metadata
+    done
+  end
+
+private
+
+  def ensure_image_magick!
+    if !windows? && `which montage`.empty?
+      error "You must have ImageMagick installed. Could not find 'montage' in your PATH."
+    end
+  end
+
+  def verify_url!
+    unless @url.to_s.match(%r{\Ahttp://www\.googleartproject\.com/})
+      error "Please specify a Google Art Project URL."
+    end
+  end
+
+  def get_image_id
+    @html = open(@url).read
+    # Reportedly the data-thumbnail can change in the middle of a long download session, but
+    # the encodedInfospotId will not. So if we key local files by the InfospotId, we can
+    # check for them if download fails and we start over. Also makes for more human names.
+    # If I run into it myself, I may adapt the code to auto-resolve a changed data-thumbnail.
+    @thumb_id = @html[/data-thumbnail="(.+?)"/, 1]
+    @perma_id = @html[/data-encodedInfospotId="(.+?)"/, 1]
+    unless @thumb_id && @perma_id
+      error "Couldn't find an image at this URL, sorry!"
+    end
+  end
+
+  def determine_zoom
+    0.upto(MAX_ZOOM_ALLOWED) do |zoom|
+      open(tile_url(0, 0, zoom))
+      @max_zoom = zoom
+    end
+  rescue OpenURI::HTTPError => e
+    raise unless e.message == "404 Not Found"
+  end
+
+  def get_tiles
+    @max_x = 999
+    @max_y = 999
+
+    0.upto(@max_y) do |y|
+      0.upto(@max_x) do |x|
+        url = tile_url(x, y, @max_zoom)
+        path = tile_path(x, y)
+        if File.exists?(path)
+          puts "Skipping #{url} (already downloaded)..."
+          next
+        end
+        begin
+          data = open(url)  # Raises at 404.
+          puts "Getting #{url}..."
+          File.open(path, "wb") { |f| f.print data.read }
+        rescue OpenURI::HTTPError => e
+          raise unless e.message == "404 Not Found"
+          if y.zero?
+            # Found max x. Start on next row.
+            @max_x = x - 1
+            break
+          else
+            # Found max y. We have all tiles, so bail.
+            @max_y = y - 1
+            return
+          end
+        end
+      end
+    end
+  end
+
+  def stitch_tiles
+    # `montage` is ImageMagick.
+    # We first stitch together the tiles of each row, then stitch all rows.
+    # Stitching the full image all at once can get extremely inefficient for large images.
+    tiles_wide = @max_x + 1
+    tiles_high = @max_y + 1
+
+    puts "Stitching #{tiles_wide} x #{tiles_high} = #{tiles_wide*tiles_high} tiles..."
+
+    0.upto(@max_y) do |y|
+      tiles = (0..@max_x).map { |x| tile_path(x, y) }.join(' ')
+      `montage #{tiles} -geometry +0+0 -tile #{tiles_wide}x1 #{row_path(y)}`
+    end
+
+    tiles = (0..@max_y).map { |y| row_path(y) }.join(' ')
+    `montage #{tiles} -geometry +0+0 -tile 1x#{tiles_high} #{full_path}`
+  end
+
+  def trim
+    # Trim the black blocks that may appear on right and bottom.
+    # We first add a black border to ensure no other color is trimmed, as described on
+    # http://www.imagemagick.org/Usage/crop/#trim
+    `convert #{full_path} -bordercolor black -border 1x1 -trim #{full_path}`
+  end
+
+  def set_metadata
+    if !windows? && !`which xattr`.empty?
+      # Set "Downloaded from" Finder metadata, like Safari does.
+      system('xattr', '-w', 'com.apple.metadata:kMDItemWhereFroms', @url, full_path)
+    end
+  end
+
+  def done
+    puts "Done: #{full_path}"
+    # Reveal in Finder if on OS X.
+    unless windows?
+      `which osascript && osascript -e 'tell app "Finder"' -e 'reveal POSIX file "#{full_path}"' -e 'activate' -e 'end'`
+    end
+  end
+
+
+  def error(message)
+    raise GAPDownloader::RuntimeError, "#{message} (#{@url})"
+  end
+
+
+  def tile_url(x, y, zoom)
+    # The subdomain can seemingly be anything from lh3 to lh6.
+    "http://lh5.ggpht.com/#{@thumb_id}=x#{x}-y#{y}-z#{zoom}"
+  end
+
+  def tile_path(x, y)
+    File.join(TEMP_DIRECTORY, "gap-#{@perma_id}-tile-#{x}-#{y}.jpg")
+  end
+
+  def row_path(y)
+    File.join(TEMP_DIRECTORY, "gap-#{@perma_id}-row-#{@max_zoom}-#{y}.jpg")
+  end
+
+  def full_path
+    File.join(OUTPUT_DIRECTORY, "#{@perma_id}.jpg")
+  end
+
+end
+
+if __FILE__ == $0
+  urls = ARGV.any? ? ARGV : (defined?(DATA) ? DATA.read.strip.split("\n")  : [])
+  puts "Error: No URLs given!" if urls.empty?
+
+  urls.each do |url|
+    begin
+      GAPDownloader.new(url).download
+    rescue GAPDownloader::RuntimeError => e
+      puts "Error: #{e.message}"
+    end
+  end
+end
